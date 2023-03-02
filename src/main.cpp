@@ -4,8 +4,15 @@ https://github.com/sparkfun/SparkFun_u-blox_GNSS_Arduino_Library/blob/main/examp
 */
 
 #include <Arduino.h>
+
 #include <WiFi.h>
+#include <ESPmDNS.h>
+
 #include "secrets.h"
+#include "constants.h"
+#include "Rover.h"
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
 #include <SparkFun_u-blox_GNSS_Arduino_Library.h> //http://librarymanager/All#SparkFun_u-blox_GNSS
 SFE_UBLOX_GNSS myGNSS;
@@ -20,19 +27,60 @@ SFE_UBLOX_GNSS myGNSS;
 
 //Global variables
 //=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
-long lastReceivedRTCM_ms = 0; //5 RTCM messages take approximately ~300ms to arrive at 115200bps
-const unsigned long maxTimeBeforeHangup_ms = 10000UL; //If we fail to get a complete RTCM frame after 10s, then disconnect from caster
+long ntripLastReceivedRTCM_ms = 0; //5 RTCM messages take approximately ~300ms to arrive at 115200bps
+const unsigned long ntripMaxTimeBeforeHangup_ms = 10000UL; //If we fail to get a complete RTCM frame after 10s, then disconnect from caster
+const unsigned ntripTimeBeforeReconnect_ms = 5000UL; //If we drop connection, try reconnect in 5s
 
-bool transmitLocation = true;        //By default we will transmit the unit's location via GGA sentence.
+bool transmitLocation = false;        //By default we will transmit the unit's location via GGA sentence.
 
 WiFiClient ntripClient; // The WiFi connection to the NTRIP server. This is global so pushGGA can see if we are connected.
+long ntripCxnDropped_ms = 0;
+
+long mqttLastReconnectAttempt_ms = 0;
+
+WiFiClient wc;
+PubSubClient mqttClient(wc);
+
+Rover rover(1,2,3,4,5,6);
+
+
+void mqttConnect(){
+  if (mqttClient.connect(MQTT_CLIENT_NAME)) {
+    // Once connected, publish an announcement...
+    mqttClient.publish(MQTT_TOPIC_STATUS,"connected");
+    // ... and resubscribe
+    mqttClient.subscribe(MQTT_TOPIC_CONTROL);
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (topic==MQTT_TOPIC_CONTROL){
+    DynamicJsonDocument json(1024);
+    deserializeJson(json,payload);
+    rover.updateSpeed(json["speedL"], json["speedR"])
+  }
+}
 
 //=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
-// Callback: Wifi connection
+// Callbacks: Wifi connection
 
 void connected_to_ap(WiFiEvent_t wifi_event, WiFiEventInfo_t wifi_info) {
   Serial.println("[+] Connected to the WiFi network");
+  Serial.println("[+] Setting up mDNS");
+  if (!MDNS.begin(MQTT_CLIENT_NAME)) {
+      Serial.println("Error setting up MDNS responder!");
+      while(1){
+          delay(1000);
+      }
+  }
+  Serial.println("[+] ....done!");
+
+  Serial.println("[+] Setting up MQTT client & connection");
+
+  mqttClient.setServer(mqttBroker,mqttPort);
+  mqttConnect();
+  mqttClient.setCallback(mqttCallback);
 }
 
 void disconnected_from_ap(WiFiEvent_t wifi_event, WiFiEventInfo_t wifi_info) {
@@ -45,9 +93,12 @@ void got_ip_from_ap(WiFiEvent_t wifi_event, WiFiEventInfo_t wifi_info) {
   Serial.println(WiFi.localIP());
 }
 
+
+
+
 //=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
-// Callback: pushGPGGA will be called when new GPGGA NMEA data arrives
+// Callback: publishGPGGA will be called when new GPGGA NMEA data arrives
 // See u-blox_structs.h for the full definition of NMEA_GGA_data_t
 //         _____  You can use any name you like for the callback. Use the same name when you call setNMEAGPGGAcallback
 //        /               _____  This _must_ be NMEA_GGA_data_t
@@ -56,18 +107,64 @@ void got_ip_from_ap(WiFiEvent_t wifi_event, WiFiEventInfo_t wifi_info) {
 //        |              |          |
 void pushGPGGA(NMEA_GGA_data_t *nmeaData)
 {
-  //Provide the caster with our current position as needed
+
+  Serial.print((const char *)nmeaData->nmea); // .nmea is printable (NULL-terminated) and already has \r\n on the end
+  
+    //Provide the caster with our current position as needed
   if ((ntripClient.connected() == true) && (transmitLocation == true))
   {
-    Serial.print(F("Pushing GGA to server: "));
-    Serial.print((const char *)nmeaData->nmea); // .nmea is printable (NULL-terminated) and already has \r\n on the end
-
+    Serial.print(F("[->] Pushing GGA to server"));
+  
     //Push our current GGA sentence to caster
     ntripClient.print((const char *)nmeaData->nmea);
   }
 }
 
+
+
 //=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
+// Callback: publishPVTdataMqtt will be called when new NAV PVT data arrives.
+//
+// See u-blox_structs.h for the full definition of UBX_NAV_PVT_data_t
+//         _____  You can use any name you like for the callback. Use the same name when you call setAutoPVTcallback
+//        /                  _____  This _must_ be UBX_NAV_PVT_data_t
+//        |                 /               _____ You can use any name you like for the struct
+//        |                 |              /
+//        |                 |              |
+void publishPVTdataMqtt(UBX_NAV_PVT_data_t *ubxDataStruct)
+{
+  DynamicJsonDocument doc(1024);
+  double latitude = (ubxDataStruct->lat)/10000000.0; // Print the latitude
+  double longitude = ubxDataStruct->lon/ 10000000.0; // Print the longitude
+  double altitude = (ubxDataStruct->hMSL)/ 1000.0  ; // Print the height above mean sea level
+  uint32_t time = ubxDataStruct->iTOW;
+
+  uint8_t fixType = ubxDataStruct->fixType; // Print the fix type
+
+  uint8_t carrSoln = ubxDataStruct->flags.bits.carrSoln; // Print the carrier solution
+
+  uint32_t hAcc = ubxDataStruct->hAcc; // Print the horizontal accuracy estimate in mm
+
+  doc["time"] = time;
+  doc["latitude"] = latitude;
+  doc["longitude"] = longitude;
+  doc["altitude"] = altitude;
+  doc["hAcc"] = hAcc;
+  doc["fixType"] = fixType;
+  
+  String jsonStr;
+  serializeJson(doc, jsonStr);
+  int strLen = jsonStr.length() + 1; 
+
+  char json[strLen];
+  jsonStr.toCharArray(json,strLen);
+  if (mqttClient.connected() == true){
+      mqttClient.publish(MQTT_TOPIC_NMEA, json);
+      Serial.print(F("[->] Publishing PVT as json to Mqtt"));
+
+  }
+}
 
 // Callback: printPVTdata will be called when new NAV PVT data arrives
 // See u-blox_structs.h for the full definition of UBX_NAV_PVT_data_t
@@ -128,6 +225,11 @@ void printPVTdata(UBX_NAV_PVT_data_t *ubxDataStruct)
   Serial.println();    
 }
 
+
+ void callbackPVTdata(UBX_NAV_PVT_data_t *ubxDataStruct){
+    publishPVTdataMqtt(ubxDataStruct);
+    printPVTdata(ubxDataStruct);
+ }
 //=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
 //Connect to NTRIP Caster. Return true is connection is successful.
@@ -256,7 +358,7 @@ bool beginClient()
     {
       Serial.print(F("Connected to: "));
       Serial.println(casterHost);
-      lastReceivedRTCM_ms = millis(); //Reset timeout
+      ntripLastReceivedRTCM_ms = millis(); //Reset timeout
     }
   } //End attempt to connect
 
@@ -273,7 +375,7 @@ bool processConnection()
   {
     uint8_t rtcmData[512 * 4]; //Most incoming data is around 500 bytes but may be larger
     size_t rtcmCount = 0;
-
+ 
     //Collect any available RTCM data
     while (ntripClient.available())
     {
@@ -285,7 +387,7 @@ bool processConnection()
 
     if (rtcmCount > 0)
     {
-      lastReceivedRTCM_ms = millis();
+      ntripLastReceivedRTCM_ms = millis();
 
       //Push RTCM to GNSS module over I2C
       myGNSS.pushRawData(rtcmData, rtcmCount);
@@ -302,7 +404,7 @@ bool processConnection()
   }  
   
   //Timeout if we don't have new data for maxTimeBeforeHangup_ms
-  if ((millis() - lastReceivedRTCM_ms) > maxTimeBeforeHangup_ms)
+  if ((millis() - ntripLastReceivedRTCM_ms) > ntripMaxTimeBeforeHangup_ms)
   {
     Serial.println(F("RTCM timeout!"));
     return (false); // Connection has timed out - return false
@@ -324,19 +426,6 @@ void closeConnection()
 
 //=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
-//Return true if a key has been pressed
-bool keyPressed()
-{
-  if (Serial.available()) // Check for a new key press
-  {
-    delay(100); // Wait for any more keystrokes to arrive
-    while (Serial.available()) // Empty the serial buffer
-      Serial.read();
-    return (true);   
-  }
-
-  return (false);
-}
 
 void setup() {
   Serial.begin(115200);
@@ -363,7 +452,7 @@ void setup() {
   myGNSS.setMainTalkerID(SFE_UBLOX_MAIN_TALKER_ID_GP);
   myGNSS.setNMEAGPGGAcallbackPtr(&pushGPGGA); // Set up the callback for GPGGA
   myGNSS.enableNMEAMessage(UBX_NMEA_GGA, COM_PORT_I2C, 10); // Tell the module to output GGA every 10 seconds
-  myGNSS.setAutoPVTcallbackPtr(&printPVTdata); // Enable automatic NAV PVT messages with callback to printPVTdata so we can watch the carrier solution go to fixed
+  myGNSS.setAutoPVTcallbackPtr(&callbackPVTdata); // Enable automatic NAV PVT messages with callback to printPVTdata so we can watch the carrier solution go to fixed
   //myGNSS.saveConfiguration(VAL_CFG_SUBSEC_IOPORT | VAL_CFG_SUBSEC_MSGCONF); //Optional: Save the ioPort and message settings to NVM
 
   Serial.print(F("Connecting to local WiFi"));
@@ -393,9 +482,9 @@ void loop()
   enum states // Use a 'state machine' to open and close the connection
   {
     open_connection,
-    push_data_and_wait_for_keypress,
+    push_data,
     close_connection,
-    waiting_for_keypress
+    connection_dropped
   };
   static states state = open_connection;
 
@@ -407,8 +496,8 @@ void loop()
       Serial.println(F("Connecting to the NTRIP caster..."));
       if (beginClient()) // Try to open the connection to the caster
       {
-        Serial.println(F("Connected to the NTRIP caster! Press any key to disconnect..."));
-        state = push_data_and_wait_for_keypress; // Move on
+        Serial.println(F("Connected to the NTRIP caster!"));
+        state = push_data; // Move on
       }
       else
       {
@@ -424,9 +513,9 @@ void loop()
 
     //=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
-    case push_data_and_wait_for_keypress:
-      // If the connection has dropped or timed out, or if the user has pressed a key
-      if ((processConnection() == false) || (keyPressed()))
+    case push_data:
+      // If the connection has dropped or timed out
+      if (processConnection() == false)
       {
         state = close_connection; // Move on
       }
@@ -436,18 +525,24 @@ void loop()
 
     case close_connection:
       Serial.println(F("Closing the connection to the NTRIP caster..."));
+      ntripCxnDropped_ms = millis();
       closeConnection();
-      Serial.println(F("Press any key to reconnect..."));
-      state = waiting_for_keypress; // Move on
+      state = connection_dropped; // Move on
       break;
     
     //=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
-    case waiting_for_keypress:
-      // If the connection has dropped or timed out, or if the user has pressed a key
-      if (keyPressed())
+    case connection_dropped:
+      // If the connection has dropped or timed out, wait for period and try reconnect
+      if (millis() - ntripCxnDropped_ms >= ntripTimeBeforeReconnect_ms)
         state = open_connection; // Move on
       break; 
   }
+
+
+  if (!mqttClient.connected()) {
+    mqttConnect();
+  }
+  mqttClient.loop();
   
 }
